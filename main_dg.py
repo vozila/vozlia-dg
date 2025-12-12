@@ -117,7 +117,7 @@ def healthz():
 # -------------------------
 # Twilio inbound (TwiML)
 # -------------------------
-@app.post("/twilio/inbound")
+@app.post("/twilio/inbound-dg")
 async def twilio_inbound(request: Request):
     form = await request.form()
     from_num = form.get("From")
