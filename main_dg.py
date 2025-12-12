@@ -30,6 +30,9 @@ app = FastAPI()
 openai_client: httpx.AsyncClient | None = None
 eleven_client: httpx.AsyncClient | None = None
 router_client: httpx.AsyncClient | None = None
+logger.info(f"PUBLIC_BASE_URL={PUBLIC_BASE_URL}")
+logger.info(f"FSM_ROUTER_URL={FSM_ROUTER_URL}")
+
 
 # -------------------------
 # Per-call state (session memory)
@@ -41,7 +44,7 @@ CALL_STATE: dict[str, dict] = {}
 # Env / Config
 # -------------------------
 PORT = int(os.getenv("PORT", "10000"))
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://vozlia-backend.onrender.com").rstrip("/")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://vozlia-dg.onrender.com").rstrip("/")
 
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
