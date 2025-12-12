@@ -119,13 +119,8 @@ def healthz():
 # -------------------------
 @app.post("/twilio/inbound-dg")
 async def twilio_inbound(request: Request):
-    form = await request.form()
-    from_num = form.get("From")
-    to_num = form.get("To")
-    call_sid = form.get("CallSid")
-    logger.info(f"Incoming call: From={from_num}, To={to_num}, CallSid={call_sid}")
-
-    stream_url = f"{PUBLIC_BASE_URL.replace('https://', 'wss://')}/twilio/stream"
+    base = str(request.base_url).rstrip("/")          # e.g. https://vozlia-dg.onrender.com
+    stream_url = base.replace("https://", "wss://") + "/twilio/stream"
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -135,6 +130,7 @@ async def twilio_inbound(request: Request):
   </Connect>
 </Response>
 """
+    logger.info(f"TwiML Stream URL => {stream_url}")
     return PlainTextResponse(twiml, media_type="application/xml")
 
 # -------------------------
