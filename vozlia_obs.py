@@ -1,20 +1,29 @@
 # vozlia_obs.py
 import os, json, time
 from collections import deque
+
+import csv
+import io
+
 from fastapi import WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 OBS_ENABLED = os.getenv("OBS_ENABLED", "1") == "1"
 OBS_LOG_JSON = os.getenv("OBS_LOG_JSON", "0") == "1"
 OBS_MAX_EVENTS_PER_CALL = int(os.getenv("OBS_MAX_EVENTS_PER_CALL", "5000"))
 OBS_BACKFILL = int(os.getenv("OBS_BACKFILL", "300"))
 
+
 class ObsHub:
     def __init__(self, logger):
         self.logger = logger
         self.events = {}   # streamSid -> deque
         self.subs = {}     # streamSid -> set(WebSocket)
-        self.started = {}  # streamSid -> ts
+        self.started = {}  # streamSid -> started_ts
+
+        # NEW: track call completion so "latest" can fall back to last completed
+        self.ended = {}              # streamSid -> ended_ts
+        self.last_completed_sid = None
 
     def ensure(self, sid: str):
         if not sid:
@@ -23,6 +32,12 @@ class ObsHub:
             self.events[sid] = deque(maxlen=OBS_MAX_EVENTS_PER_CALL)
             self.subs[sid] = set()
             self.started[sid] = time.time()
+
+    def mark_ended(self, sid: str):
+        if not sid:
+            return
+        self.ended[sid] = time.time()
+        self.last_completed_sid = sid
 
     def list_calls(self):
         items = sorted(self.started.items(), key=lambda x: x[1], reverse=True)
@@ -33,6 +48,25 @@ class ObsHub:
             return []
         evs = list(self.events[sid])
         return evs if limit <= 0 else evs[-limit:]
+
+    def latest_active_sid(self) -> str | None:
+        active = [(sid, ts) for sid, ts in self.started.items() if sid not in self.ended]
+        if not active:
+            return None
+        active.sort(key=lambda x: x[1], reverse=True)
+        return active[0][0]
+
+    def latest_completed_sid(self) -> str | None:
+        if self.last_completed_sid:
+            return self.last_completed_sid
+        if not self.ended:
+            return None
+        items = sorted(self.ended.items(), key=lambda x: x[1], reverse=True)
+        return items[0][0]
+
+    def latest_sid(self) -> str | None:
+        # Prefer active for live dashboard; fall back to most recent completed
+        return self.latest_active_sid() or self.latest_completed_sid()
 
     async def emit(self, sid: str, event: dict):
         if not OBS_ENABLED or not sid:
@@ -71,10 +105,19 @@ class ObsHub:
  .card {{ border:1px solid #ddd; border-radius:12px; padding:12px; flex:1; min-width:340px; }}
  #log {{ height:220px; overflow:auto; background:#0b0b0b; color:#d7d7d7; padding:10px; border-radius:10px;
         font-family: ui-monospace, Menlo, monospace; font-size:12px; }}
+ .muted {{ color:#666; font-size:13px; }}
+ .pill {{ display:inline-block; padding:2px 8px; border-radius:999px; background:#f2f2f2; margin-right:8px; }}
 </style>
 </head><body>
-<h2>Flow B Observability: {sid}</h2>
-<div class="row">
+<h2>Flow B Observability: <span class="pill">{sid}</span></h2>
+<div class="muted">
+No-SID links:
+<a href="/obs/latest" target="_blank">/obs/latest</a> ·
+<a href="/obs/latest/export.csv" target="_blank">CSV</a> ·
+<a href="/obs/latest/export.jsonl" target="_blank">JSONL</a>
+</div>
+
+<div class="row" style="margin-top:10px;">
   <div class="card"><h3>Inbound (Twilio → Render)</h3><div id="in_dt"></div><div id="in_bytes"></div><div id="in_rms"></div></div>
   <div class="card"><h3>Outbound (Render → Twilio)</h3><div id="out_dt"></div><div id="out_bytes"></div><div id="out_rms"></div></div>
 </div>
@@ -132,6 +175,7 @@ ws.onmessage=(m)=>{{
 </script>
 </body></html>"""
 
+
 async def ws_handler(hub: ObsHub, websocket: WebSocket, sid: str):
     await websocket.accept()
     hub.ensure(sid)
@@ -152,6 +196,30 @@ async def ws_handler(hub: ObsHub, websocket: WebSocket, sid: str):
     finally:
         hub.subs.get(sid, set()).discard(websocket)
 
+
+def _csv_stream_for_events(evs: list[dict]):
+    cols = set()
+    for e in evs:
+        if isinstance(e, dict):
+            cols.update(e.keys())
+
+    ordered = ["ts", "streamSid", "type", "dt_ms", "bytes", "rms", "seq", "router_ms", "tts_ms", "speak_ms"]
+    rest = sorted([c for c in cols if c not in ordered])
+    fieldnames = [c for c in ordered if c in cols] + rest
+
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+    w.writeheader()
+    for e in evs:
+        row = {}
+        for k in fieldnames:
+            v = e.get(k)
+            row[k] = json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else v
+        w.writerow(row)
+
+    yield buf.getvalue()
+
+
 def mount_routes(app, hub: ObsHub):
     @app.get("/obs/calls")
     def _calls():
@@ -164,6 +232,80 @@ def mount_routes(app, hub: ObsHub):
     @app.get("/obs/call/{sid}")
     def _dash(sid: str):
         return HTMLResponse(hub.dashboard_html(sid))
+
+    @app.get("/obs/latest")
+    def _latest_dash():
+        sid = hub.latest_sid()
+        if not sid:
+            return HTMLResponse("<h3>No calls yet.</h3>")
+        return HTMLResponse(hub.dashboard_html(sid))
+
+    @app.get("/obs/latest/events")
+    def _latest_events(limit: int = 2000):
+        sid = hub.latest_sid()
+        if not sid:
+            return {"ok": False, "error": "no calls yet"}
+        return {"ok": True, "streamSid": sid, "events": hub.last_events(sid, limit=limit)}
+
+    @app.get("/obs/latest/export.csv")
+    def _latest_export_csv(limit: int = 200000):
+        sid = hub.latest_sid()
+        if not sid:
+            return {"ok": False, "error": "no calls yet"}
+        evs = hub.last_events(sid, limit=limit)
+        if not evs:
+            return {"ok": False, "error": "no events", "streamSid": sid}
+        return StreamingResponse(
+            _csv_stream_for_events(evs),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="vozlia_obs_latest_{sid}.csv"'},
+        )
+
+    @app.get("/obs/latest/export.jsonl")
+    def _latest_export_jsonl(limit: int = 200000):
+        sid = hub.latest_sid()
+        if not sid:
+            return {"ok": False, "error": "no calls yet"}
+        evs = hub.last_events(sid, limit=limit)
+        if not evs:
+            return {"ok": False, "error": "no events", "streamSid": sid}
+
+        def gen():
+            for e in evs:
+                yield json.dumps(e, ensure_ascii=False) + "\n"
+
+        return StreamingResponse(
+            gen(),
+            media_type="application/x-ndjson",
+            headers={"Content-Disposition": f'attachment; filename="vozlia_obs_latest_{sid}.jsonl"'},
+        )
+
+    @app.get("/obs/export/{sid}.csv")
+    def _export_csv(sid: str, limit: int = 200000):
+        evs = hub.last_events(sid, limit=limit)
+        if not evs:
+            return {"ok": False, "error": "no events for streamSid", "streamSid": sid}
+        return StreamingResponse(
+            _csv_stream_for_events(evs),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="vozlia_obs_{sid}.csv"'},
+        )
+
+    @app.get("/obs/export/{sid}.jsonl")
+    def _export_jsonl(sid: str, limit: int = 200000):
+        evs = hub.last_events(sid, limit=limit)
+        if not evs:
+            return {"ok": False, "error": "no events for streamSid", "streamSid": sid}
+
+        def gen():
+            for e in evs:
+                yield json.dumps(e, ensure_ascii=False) + "\n"
+
+        return StreamingResponse(
+            gen(),
+            media_type="application/x-ndjson",
+            headers={"Content-Disposition": f'attachment; filename="vozlia_obs_{sid}.jsonl"'},
+        )
 
     @app.websocket("/ws/obs/{sid}")
     async def _ws(websocket: WebSocket, sid: str):
