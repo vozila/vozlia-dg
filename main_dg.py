@@ -18,13 +18,16 @@ from fastapi.responses import PlainTextResponse
 from vozlia_obs import ObsHub, mount_routes  # <- your obs hub/routes
 
 
-
-
 # -------------------------
-# Logging
+# Logging (ENV controlled)
 # -------------------------
-logging.basicConfig(level=logging.INFO)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper().strip()
+if LOG_LEVEL in ("OFF", "NONE", "0"):
+    LOG_LEVEL = "CRITICAL"
+
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("vozlia")
+logger.info("LOG_LEVEL=%s", LOG_LEVEL)
 
 # -------------------------
 # App
@@ -34,14 +37,38 @@ app = FastAPI()
 # -------------------------
 # Routers
 # -------------------------
-
 from assistant_route import router as assistant_router
 app.include_router(assistant_router)
+
 # -------------------------
 # Observability hub + routes
 # -------------------------
 obs = ObsHub(logger)
 mount_routes(app, obs)
+
+# -------------------------
+# OBS toggles (ENV controlled)
+# -------------------------
+# OBS_ENABLED=0 disables all obs.emit() calls (best for call quality)
+OBS_ENABLED = os.getenv("OBS_ENABLED", "1") == "1"
+
+# OBS_AUDIO=0 disables per-frame audio_in/audio_out emits (biggest cost)
+OBS_AUDIO = os.getenv("OBS_AUDIO", "1") == "1"
+
+# OBS_RMS=1 enables RMS computation; default OFF (recommended)
+OBS_RMS = os.getenv("OBS_RMS", "0") == "1"
+
+def obs_emit_ok() -> bool:
+    return OBS_ENABLED
+
+def obs_audio_ok() -> bool:
+    return OBS_ENABLED and OBS_AUDIO
+
+def maybe_rms(b: bytes) -> Optional[float]:
+    if not OBS_RMS:
+        return None
+    return round(ulaw_rms(b), 2)
+
 
 # -------------------------
 # Shared HTTP clients (performance)
@@ -88,6 +115,7 @@ TWILIO_FRAME_SECONDS = 0.02
 
 logger.info(f"PUBLIC_BASE_URL={PUBLIC_BASE_URL}")
 logger.info(f"FSM_ROUTER_URL={FSM_ROUTER_URL}")
+logger.info(f"OBS_ENABLED={OBS_ENABLED} OBS_AUDIO={OBS_AUDIO} OBS_RMS={OBS_RMS}")
 
 
 # -------------------------
@@ -250,17 +278,18 @@ async def stream_ulaw_audio_to_twilio(
         dt_ms = (now - last_send_ts) * 1000.0 if last_send_ts else 0.0
         last_send_ts = now
 
-        # OBS: outbound chunk
-        await obs.emit(
-            stream_sid,
-            {
-                "type": "audio_out",
-                "seq": seq,
-                "bytes": len(chunk),
-                "dt_ms": round(dt_ms, 2),
-                "rms": round(ulaw_rms(chunk), 2),
-            },
-        )
+        # OBS: outbound chunk (ONLY if enabled)
+        if obs_audio_ok():
+            await obs.emit(
+                stream_sid,
+                {
+                    "type": "audio_out",
+                    "seq": seq,
+                    "bytes": len(chunk),
+                    "dt_ms": round(dt_ms, 2),
+                    "rms": maybe_rms(chunk),
+                },
+            )
 
         msg = {"event": "media", "streamSid": stream_sid, "media": {"payload": _bytes_to_b64(chunk)}}
         await twilio_ws.send_text(json.dumps(msg))
@@ -386,16 +415,17 @@ async def twilio_stream(websocket: WebSocket):
                     await stream_ulaw_audio_to_twilio(websocket, stream_sid, ulaw, speak_cancel)
                     speak_ms = (time.time() - speak0) * 1000.0
 
-                    # OBS: stage timing (router_ms may be filled by caller)
-                    await obs.emit(
-                        stream_sid,
-                        {
-                            "type": "stage",
-                            "tts_ms": round(tts_ms, 2),
-                            "speak_ms": round(speak_ms, 2),
-                            "total_ms": round((time.time() - t0) * 1000.0, 2),
-                        },
-                    )
+                    # OBS: stage timing (ONLY if enabled)
+                    if obs_emit_ok():
+                        await obs.emit(
+                            stream_sid,
+                            {
+                                "type": "stage",
+                                "tts_ms": round(tts_ms, 2),
+                                "speak_ms": round(speak_ms, 2),
+                                "total_ms": round((time.time() - t0) * 1000.0, 2),
+                            },
+                        )
 
                 except asyncio.CancelledError:
                     pass
@@ -467,11 +497,12 @@ async def twilio_stream(websocket: WebSocket):
                 reply = await call_fsm_router(transcript, meta={"stream_sid": stream_sid, "state": state})
                 router_ms = (time.time() - r0) * 1000.0
 
-                # OBS: router stage
-                await obs.emit(
-                    stream_sid,
-                    {"type": "stage", "router_ms": round(router_ms, 2)},
-                )
+                # OBS: router stage (ONLY if enabled)
+                if obs_emit_ok():
+                    await obs.emit(
+                        stream_sid,
+                        {"type": "stage", "router_ms": round(router_ms, 2)},
+                    )
 
                 logger.info(f"Router reply: {reply}")
 
@@ -516,8 +547,10 @@ async def twilio_stream(websocket: WebSocket):
 
                 if stream_sid:
                     CALL_STATE[stream_sid] = {"topic": None, "last_user": "", "last_bot": ""}
-                    obs.ensure(stream_sid)
-                    await obs.emit(stream_sid, {"type": "call_start"})
+
+                    if obs_emit_ok():
+                        obs.ensure(stream_sid)
+                        await obs.emit(stream_sid, {"type": "call_start"})
 
                 try:
                     await speak("I’m connected. How can I help you today?")
@@ -535,22 +568,23 @@ async def twilio_stream(websocket: WebSocket):
 
                 audio_bytes = _b64_to_bytes(payload_b64)
 
-                # OBS: inbound chunk stats
-                in_seq += 1
-                now = time.time()
-                dt_ms = (now - in_last_ts) * 1000.0 if in_last_ts else 0.0
-                in_last_ts = now
+                # OBS: inbound chunk stats (ONLY if enabled)
+                if obs_audio_ok():
+                    in_seq += 1
+                    now = time.time()
+                    dt_ms = (now - in_last_ts) * 1000.0 if in_last_ts else 0.0
+                    in_last_ts = now
 
-                await obs.emit(
-                    stream_sid,
-                    {
-                        "type": "audio_in",
-                        "seq": in_seq,
-                        "bytes": len(audio_bytes),
-                        "dt_ms": round(dt_ms, 2),
-                        "rms": round(ulaw_rms(audio_bytes), 2),
-                    },
-                )
+                    await obs.emit(
+                        stream_sid,
+                        {
+                            "type": "audio_in",
+                            "seq": in_seq,
+                            "bytes": len(audio_bytes),
+                            "dt_ms": round(dt_ms, 2),
+                            "rms": maybe_rms(audio_bytes),
+                        },
+                    )
 
                 # forward to Deepgram
                 if dg_ws is not None:
@@ -588,11 +622,10 @@ async def twilio_stream(websocket: WebSocket):
             except Exception:
                 pass
 
-        # OBS: mark end (so "latest" can fall back to completed)
-        if stream_sid:
+        # OBS: mark end (ONLY if enabled)
+        if stream_sid and obs_emit_ok():
             try:
                 await obs.emit(stream_sid, {"type": "call_end"})
-                # Your current vozlia_obs.py has mark_ended(). If not, comment this out.
                 if hasattr(obs, "mark_ended"):
                     obs.mark_ended(stream_sid)
             except Exception:
