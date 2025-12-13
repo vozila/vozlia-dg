@@ -71,7 +71,7 @@ class ObsHub:
             self.subs.get(sid, set()).discard(ws)
 
     def _csv_stream(self, sid: str):
-        # Stream CSV without loading gigantic strings
+        # Stream CSV without building a huge in-memory string
         fieldnames = [
             "ts", "t_rel_s", "streamSid", "type",
             "dt_ms", "bytes", "rms", "seq",
@@ -84,7 +84,8 @@ class ObsHub:
             writer = csv.DictWriter(buf, fieldnames=fieldnames)
             writer.writeheader()
             yield buf.getvalue()
-            buf.seek(0); buf.truncate(0)
+            buf.seek(0)
+            buf.truncate(0)
 
             for ev in self.last_events(sid, limit=0):
                 ts = float(ev.get("ts") or 0.0)
@@ -104,34 +105,36 @@ class ObsHub:
                 }
                 writer.writerow(row)
                 yield buf.getvalue()
-                buf.seek(0); buf.truncate(0)
+                buf.seek(0)
+                buf.truncate(0)
 
         return gen()
 
     def dashboard_html(self, sid: str) -> str:
-        started_ts = self.started.get(sid) or 0.0
+        started_ts = float(self.started.get(sid) or 0.0)
 
-        return f"""<!doctype html>
+        # IMPORTANT: NOT an f-string. Avoids breaking on JS/CSS braces and prevents 500s.
+        html = """<!doctype html>
 <html><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Vozlia Obs {sid}</title>
+<title>Vozlia Obs __SID__</title>
 <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
 <style>
-  body {{ font-family: system-ui; margin:16px; }}
-  .row {{ display:flex; gap:16px; flex-wrap:wrap; }}
-  .card {{ border:1px solid #ddd; border-radius:12px; padding:12px; flex:1; min-width:340px; }}
-  #log {{ height:220px; overflow:auto; background:#0b0b0b; color:#d7d7d7; padding:10px; border-radius:10px;
-         font-family: ui-monospace, Menlo, monospace; font-size:12px; }}
-  .pill {{ display:inline-block; padding:2px 8px; border-radius:999px; background:#f2f2f2; margin-right:8px; }}
-  .actions a {{ margin-right:12px; }}
+  body { font-family: system-ui; margin:16px; }
+  .row { display:flex; gap:16px; flex-wrap:wrap; }
+  .card { border:1px solid #ddd; border-radius:12px; padding:12px; flex:1; min-width:340px; }
+  #log { height:220px; overflow:auto; background:#0b0b0b; color:#d7d7d7; padding:10px; border-radius:10px;
+         font-family: ui-monospace, Menlo, monospace; font-size:12px; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#f2f2f2; margin-right:8px; }
+  .actions a { margin-right:12px; }
 </style>
 </head><body>
 
-<h2>Flow B Observability: <span class="pill">{sid}</span></h2>
+<h2>Flow B Observability: <span class="pill">__SID__</span></h2>
 <div class="actions">
   <a href="/obs/latest">Latest dashboard</a>
   <a href="/obs/latest.csv">Download latest CSV</a>
-  <a href="/obs/csv/{sid}">Download this CSV</a>
+  <a href="/obs/csv/__SID__">Download this CSV</a>
   <a href="/obs/calls">List calls</a>
 </div>
 
@@ -146,67 +149,45 @@ class ObsHub:
 </div>
 
 <script>
-const sid = "{sid}";
-const startedTs = {started_ts}; // epoch seconds
+const sid = "__SID__";
+const startedTs = __STARTED_TS__; // epoch seconds
+
 const wsProto = (location.protocol === "https:") ? "wss" : "ws";
-const wsUrl = `${{wsProto}}://${{location.host}}/ws/obs/${{sid}}`;
+const wsUrl = `${wsProto}://${location.host}/ws/obs/${sid}`;
 
 // --- chart config ---
 const N = 1200;              // points kept per trace
 const FLUSH_MS = 250;        // throttle plotting
-function S(){{ return {{x:[], y:[]}}; }}
 
-// we plot x as seconds since call start for readability + smoothness
-function relTs(ts) {{
+// x-axis = seconds since call start
+function relTs(ts) {
   if (!startedTs) return ts;
   return (ts - startedTs);
-}}
+}
 
-const inDt=S(), inBytes=S(), inRms=S();
-const outDt=S(), outBytes=S(), outRms=S();
-const stage={{x:[], router:[], tts:[], speak:[]}};
-
-function trimSeries(s) {{
-  if (s.x.length > N) {{
-    const extra = s.x.length - N;
-    s.x.splice(0, extra);
-    s.y.splice(0, extra);
-  }}
-}}
-
-function trimStages() {{
-  if (stage.x.length > N) {{
-    const extra = stage.x.length - N;
-    stage.x.splice(0, extra);
-    stage.router.splice(0, extra);
-    stage.tts.splice(0, extra);
-    stage.speak.splice(0, extra);
-  }}
-}}
-
-function initPlot(divId, title) {{
+function initPlot(divId, title) {
   Plotly.newPlot(divId, [
-    {{x:[], y:[], type:"scatter", mode:"lines", line:{{shape:"spline"}}}}
-  ], {{
+    {x:[], y:[], type:"scatter", mode:"lines", line:{shape:"spline"}}
+  ], {
     title,
-    margin:{{t:36,l:50,r:10,b:40}},
-    xaxis:{{title:"seconds since call start"}},
-    yaxis:{{automargin:true}}
-  }}, {{displayModeBar:false}});
-}}
+    margin:{t:36,l:50,r:10,b:40},
+    xaxis:{title:"seconds since call start"},
+    yaxis:{automargin:true}
+  }, {displayModeBar:false});
+}
 
-function initStages() {{
+function initStages() {
   Plotly.newPlot("stages", [
-    {{x:[], y:[], type:"scatter", mode:"lines", name:"router_ms", line:{{shape:"spline"}}}},
-    {{x:[], y:[], type:"scatter", mode:"lines", name:"tts_ms",    line:{{shape:"spline"}}}},
-    {{x:[], y:[], type:"scatter", mode:"lines", name:"speak_ms",  line:{{shape:"spline"}}}},
-  ], {{
+    {x:[], y:[], type:"scatter", mode:"lines", name:"router_ms", line:{shape:"spline"}},
+    {x:[], y:[], type:"scatter", mode:"lines", name:"tts_ms",    line:{shape:"spline"}},
+    {x:[], y:[], type:"scatter", mode:"lines", name:"speak_ms",  line:{shape:"spline"}},
+  ], {
     title:"Timings (ms)",
-    margin:{{t:36,l:50,r:10,b:40}},
-    xaxis:{{title:"seconds since call start"}},
-    yaxis:{{title:"ms", automargin:true}}
-  }}, {{displayModeBar:false}});
-}}
+    margin:{t:36,l:50,r:10,b:40},
+    xaxis:{title:"seconds since call start"},
+    yaxis:{title:"ms", automargin:true}
+  }, {displayModeBar:false});
+}
 
 initPlot("in_dt", "Inbound dt_ms");
 initPlot("in_bytes", "Inbound bytes");
@@ -216,79 +197,76 @@ initPlot("out_bytes", "Outbound bytes");
 initPlot("out_rms", "Outbound rms");
 initStages();
 
-function logLine(o) {{
+function logLine(o) {
   const el = document.getElementById("log");
   el.textContent += JSON.stringify(o) + "\\n";
   el.scrollTop = el.scrollHeight;
   if (el.textContent.length > 200000) el.textContent = el.textContent.slice(-160000);
-}}
+}
 
 // --- buffered updates for smoothness ---
 let qInDt=[], qInBytes=[], qInRms=[];
 let qOutDt=[], qOutBytes=[], qOutRms=[];
 let qStage=[];
 
-function flush() {{
-  // inbound
-  if (qInDt.length) {{
-    Plotly.extendTraces("in_dt",    {{x:[qInDt.map(p=>p[0])],    y:[qInDt.map(p=>p[1])]}},    [0], N);
-    Plotly.extendTraces("in_bytes", {{x:[qInBytes.map(p=>p[0])], y:[qInBytes.map(p=>p[1])]}}, [0], N);
-    Plotly.extendTraces("in_rms",   {{x:[qInRms.map(p=>p[0])],   y:[qInRms.map(p=>p[1])]}},   [0], N);
+function flush() {
+  if (qInDt.length) {
+    Plotly.extendTraces("in_dt",    {x:[qInDt.map(p=>p[0])],    y:[qInDt.map(p=>p[1])]},    [0], N);
+    Plotly.extendTraces("in_bytes", {x:[qInBytes.map(p=>p[0])], y:[qInBytes.map(p=>p[1])]}, [0], N);
+    Plotly.extendTraces("in_rms",   {x:[qInRms.map(p=>p[0])],   y:[qInRms.map(p=>p[1])]},   [0], N);
     qInDt=[]; qInBytes=[]; qInRms=[];
-  }}
-  // outbound
-  if (qOutDt.length) {{
-    Plotly.extendTraces("out_dt",    {{x:[qOutDt.map(p=>p[0])],    y:[qOutDt.map(p=>p[1])]}},    [0], N);
-    Plotly.extendTraces("out_bytes", {{x:[qOutBytes.map(p=>p[0])], y:[qOutBytes.map(p=>p[1])]}}, [0], N);
-    Plotly.extendTraces("out_rms",   {{x:[qOutRms.map(p=>p[0])],   y:[qOutRms.map(p=>p[1])]}},   [0], N);
+  }
+  if (qOutDt.length) {
+    Plotly.extendTraces("out_dt",    {x:[qOutDt.map(p=>p[0])],    y:[qOutDt.map(p=>p[1])]},    [0], N);
+    Plotly.extendTraces("out_bytes", {x:[qOutBytes.map(p=>p[0])], y:[qOutBytes.map(p=>p[1])]}, [0], N);
+    Plotly.extendTraces("out_rms",   {x:[qOutRms.map(p=>p[0])],   y:[qOutRms.map(p=>p[1])]},   [0], N);
     qOutDt=[]; qOutBytes=[]; qOutRms=[];
-  }}
-  // stages
-  if (qStage.length) {{
+  }
+  if (qStage.length) {
     const xs = qStage.map(p=>p[0]);
-    Plotly.extendTraces("stages", {{
+    Plotly.extendTraces("stages", {
       x:[xs, xs, xs],
-      y:[
-        qStage.map(p=>p[1]),
-        qStage.map(p=>p[2]),
-        qStage.map(p=>p[3]),
-      ]
-    }}, [0,1,2], N);
+      y:[ qStage.map(p=>p[1]), qStage.map(p=>p[2]), qStage.map(p=>p[3]) ]
+    }, [0,1,2], N);
     qStage=[];
-  }}
-}}
-setInterval(flush, {FLUSH_MS});
+  }
+}
+setInterval(flush, FLUSH_MS);
 
 const ws = new WebSocket(wsUrl);
-ws.onopen  = () => logLine({{info:"ws connected", wsUrl}});
-ws.onclose = () => logLine({{info:"ws closed"}});
-ws.onerror = (e) => logLine({{error:"ws error", e:String(e)}});
+ws.onopen  = () => logLine({info:"ws connected", wsUrl});
+ws.onclose = () => logLine({info:"ws closed"});
+ws.onerror = (e) => logLine({error:"ws error", e:String(e)});
 
-ws.onmessage = (m) => {{
-  let ev=null; try {{ ev = JSON.parse(m.data); }} catch {{ return; }}
+ws.onmessage = (m) => {
+  let ev=null; try { ev = JSON.parse(m.data); } catch { return; }
   logLine(ev);
 
   const x = relTs(ev.ts);
 
-  if (ev.type === "audio_in") {{
+  if (ev.type === "audio_in") {
     qInDt.push([x, ev.dt_ms]);
     qInBytes.push([x, ev.bytes]);
     qInRms.push([x, ev.rms]);
-  }}
-
-  if (ev.type === "audio_out") {{
+  }
+  if (ev.type === "audio_out") {
     qOutDt.push([x, ev.dt_ms]);
     qOutBytes.push([x, ev.bytes]);
     qOutRms.push([x, ev.rms]);
-  }}
-
-  if (ev.type === "stage") {{
+  }
+  if (ev.type === "stage") {
     qStage.push([x, ev.router_ms ?? null, ev.tts_ms ?? null, ev.speak_ms ?? null]);
-  }}
-}};
+  }
+};
 </script>
 
-</body></html>"""
+</body></html>
+"""
+
+        # safe placeholder replacement
+        html = html.replace("__SID__", sid)
+        html = html.replace("__STARTED_TS__", str(started_ts))
+        return html
 
 
 async def ws_handler(hub: ObsHub, websocket: WebSocket, sid: str):
