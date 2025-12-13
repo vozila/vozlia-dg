@@ -6,6 +6,8 @@ import asyncio
 import logging
 import signal
 import re
+import math
+from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple
 
 import httpx
@@ -30,9 +32,6 @@ app = FastAPI()
 openai_client: httpx.AsyncClient | None = None
 eleven_client: httpx.AsyncClient | None = None
 router_client: httpx.AsyncClient | None = None
-logger.info(f"PUBLIC_BASE_URL={PUBLIC_BASE_URL}")
-logger.info(f"FSM_ROUTER_URL={FSM_ROUTER_URL}")
-
 
 # -------------------------
 # Per-call state (session memory)
@@ -76,8 +75,84 @@ TWILIO_FRAME_BYTES = 160
 TWILIO_FRAME_SECONDS = 0.02
 
 # Keep TTS outputs short enough to avoid long “dead air” stretches
-MAX_SPOKEN_CHARS = int(os.getenv("MAX_SPOKEN_CHARS", "700"))  # ~45–60s depending on voice
-ACK_BEFORE_THINKING = os.getenv("ACK_BEFORE_THINKING", "0") == "1"  # optional
+MAX_SPOKEN_CHARS = int(os.getenv("MAX_SPOKEN_CHARS", "700"))
+ACK_BEFORE_THINKING = os.getenv("ACK_BEFORE_THINKING", "0") == "1"
+
+logger.info(f"PUBLIC_BASE_URL={PUBLIC_BASE_URL}")
+logger.info(f"FSM_ROUTER_URL={FSM_ROUTER_URL}")
+
+# -------------------------
+# Audio probe logging (toggle)
+# -------------------------
+AUDIO_DEBUG = os.getenv("AUDIO_DEBUG", "0") == "1"
+AUDIO_DEBUG_SAMPLE_EVERY_N = int(os.getenv("AUDIO_DEBUG_SAMPLE_EVERY_N", "25"))
+
+# µ-law decode table (fast-ish) for basic energy checks
+# Source: standard G.711 µ-law expansion
+MU_LAW_DECODE_TABLE = []
+for i in range(256):
+    mu = ~i & 0xFF
+    sign = (mu & 0x80)
+    exponent = (mu >> 4) & 0x07
+    mantissa = mu & 0x0F
+    magnitude = ((mantissa << 1) + 1) << (exponent + 2)
+    sample = magnitude - 132
+    MU_LAW_DECODE_TABLE.append(-sample if sign else sample)
+
+
+def ulaw_rms(ulaw_bytes: bytes) -> float:
+    # Returns RMS in PCM-ish units (not dBFS), just for “is it alive / clipping / garbage?”
+    if not ulaw_bytes:
+        return 0.0
+    acc = 0.0
+    for b in ulaw_bytes:
+        s = MU_LAW_DECODE_TABLE[b]
+        acc += s * s
+    return math.sqrt(acc / len(ulaw_bytes))
+
+
+@dataclass
+class StreamProbe:
+    stream_sid: str
+    dir: str  # "in" or "out"
+    frame_count: int = 0
+    bytes_total: int = 0
+    last_ts: float = 0.0
+    last_log_frame: int = 0
+
+    def log_frame(self, logger, raw_bytes: bytes, meta: dict | None = None):
+        if not AUDIO_DEBUG:
+            return
+        self.frame_count += 1
+        self.bytes_total += len(raw_bytes)
+
+        now = time.time()
+        dt_ms = (now - self.last_ts) * 1000.0 if self.last_ts else 0.0
+        self.last_ts = now
+
+        # sample logs every N frames
+        if (self.frame_count - self.last_log_frame) < AUDIO_DEBUG_SAMPLE_EVERY_N:
+            return
+        self.last_log_frame = self.frame_count
+
+        rms = ulaw_rms(raw_bytes)
+        # Typical Twilio 20ms @ 8kHz µ-law = 160 bytes per frame
+        logger.info(
+            "[AUDIO_PROBE] %s streamSid=%s frame=%d bytes=%d dt_ms=%.1f rms=%.1f meta=%s",
+            self.dir, self.stream_sid, self.frame_count, len(raw_bytes), dt_ms, rms,
+            json.dumps(meta or {}, ensure_ascii=False),
+        )
+
+
+def sniff_audio_header(b: bytes) -> str:
+    if len(b) >= 4 and b[:4] == b"RIFF":
+        return "wav/riff"
+    if len(b) >= 3 and b[:3] == b"ID3":
+        return "mp3/id3"
+    if len(b) >= 2 and b[0] == 0xFF and (b[1] & 0xE0) == 0xE0:
+        return "mp3/frame"
+    return "unknown/raw"
+
 
 # -------------------------
 # Lifecycle + SIGTERM
@@ -90,6 +165,7 @@ async def startup():
     eleven_client = httpx.AsyncClient(timeout=45.0)
     router_client = httpx.AsyncClient(timeout=25.0)
 
+
 @app.on_event("shutdown")
 async def shutdown():
     global openai_client, eleven_client, router_client
@@ -101,8 +177,10 @@ async def shutdown():
     if router_client:
         await router_client.aclose()
 
+
 def _handle_sigterm(*_):
     logger.warning("SIGTERM received")
+
 
 signal.signal(signal.SIGTERM, _handle_sigterm)
 
@@ -111,18 +189,20 @@ signal.signal(signal.SIGTERM, _handle_sigterm)
 # -------------------------
 @app.get("/")
 def root():
-    return {"ok": True, "service": "vozlia-backend", "pipeline": "twilio->deepgram->openai->elevenlabs"}
+    return {"ok": True, "service": "vozlia-dg", "pipeline": "twilio->deepgram->router->openai->elevenlabs->twilio"}
+
 
 @app.get("/healthz")
 def healthz():
     return {"ok": True}
+
 
 # -------------------------
 # Twilio inbound (TwiML)
 # -------------------------
 @app.post("/twilio/inbound-dg")
 async def twilio_inbound(request: Request):
-    base = str(request.base_url).rstrip("/")          # e.g. https://vozlia-dg.onrender.com
+    base = str(request.base_url).rstrip("/")  # e.g. https://vozlia-dg.onrender.com
     stream_url = base.replace("https://", "wss://") + "/twilio/stream"
 
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -136,14 +216,17 @@ async def twilio_inbound(request: Request):
     logger.info(f"TwiML Stream URL => {stream_url}")
     return PlainTextResponse(twiml, media_type="application/xml")
 
+
 # -------------------------
 # Helpers
 # -------------------------
 def _b64_to_bytes(b64: str) -> bytes:
     return base64.b64decode(b64.encode("utf-8"))
 
+
 def _bytes_to_b64(raw: bytes) -> str:
     return base64.b64encode(raw).decode("utf-8")
+
 
 def deepgram_ws_url() -> str:
     params = (
@@ -158,11 +241,13 @@ def deepgram_ws_url() -> str:
     )
     return f"wss://api.deepgram.com/v1/listen?{params}"
 
+
 async def twilio_clear(twilio_ws: WebSocket, stream_sid: str):
     try:
         await twilio_ws.send_text(json.dumps({"event": "clear", "streamSid": stream_sid}))
     except Exception:
         logger.exception("Failed to send Twilio clear")
+
 
 def _trim_for_voice(text: str) -> str:
     t = (text or "").strip()
@@ -170,20 +255,20 @@ def _trim_for_voice(text: str) -> str:
         return "Okay."
     if len(t) <= MAX_SPOKEN_CHARS:
         return t
-    # Try to cut at a sentence boundary
+
     cut = t[:MAX_SPOKEN_CHARS]
-    m = re.search(r"(.+?[.!?])\s", cut[::-1])  # reverse search is messy; do forward instead
-    # Simpler: find last sentence end in cut
     last = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
     if last > 200:
         return cut[: last + 1].strip() + " If you want, I can keep going."
     return cut.strip() + "… If you want, I can keep going."
+
 
 async def stream_ulaw_audio_to_twilio(
     twilio_ws: WebSocket,
     stream_sid: str,
     ulaw_audio: bytes,
     cancel_event: asyncio.Event,
+    out_probe: Optional[StreamProbe] = None,
 ):
     """
     CRITICAL: pace the stream. Twilio media expects near-realtime audio.
@@ -196,10 +281,14 @@ async def stream_ulaw_audio_to_twilio(
             return
         chunk = ulaw_audio[idx: idx + TWILIO_FRAME_BYTES]
         idx += TWILIO_FRAME_BYTES
+
+        if out_probe:
+            out_probe.log_frame(logger, chunk, meta={"stage": "to_twilio"})
+
         msg = {"event": "media", "streamSid": stream_sid, "media": {"payload": _bytes_to_b64(chunk)}}
         await twilio_ws.send_text(json.dumps(msg))
-        # pace at 20ms per frame
         await asyncio.sleep(TWILIO_FRAME_SECONDS)
+
 
 async def elevenlabs_tts_ulaw_bytes(text: str) -> bytes:
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}?output_format=ulaw_8000"
@@ -221,10 +310,21 @@ async def elevenlabs_tts_ulaw_bytes(text: str) -> bytes:
         r = await eleven_client.post(url, headers=headers, json=body)
 
     r.raise_for_status()
+
+    ctype = r.headers.get("content-type", "")
+    head = sniff_audio_header(r.content[:16])
     logger.info(
-        f"ElevenLabs OK: content-type={r.headers.get('content-type')} bytes={len(r.content)} first10={r.content[:10]}"
+        f"ElevenLabs OK: content-type={ctype} bytes={len(r.content)} header={head} first10={r.content[:10]}"
     )
+
+    # If we ever see mp3/wav headers here, something is wrong and will sound like static to Twilio.
+    if head.startswith("mp3") or head.startswith("wav"):
+        logger.warning(
+            f"[AUDIO_WARN] ElevenLabs returned {head} but Twilio expects ulaw_8000. This can cause static."
+        )
+
     return r.content
+
 
 async def call_fsm_router(text: str, meta: Optional[Dict[str, Any]] = None) -> str:
     payload = {"text": text, "meta": meta or {}}
@@ -251,6 +351,7 @@ async def call_fsm_router(text: str, meta: Optional[Dict[str, Any]] = None) -> s
         logger.exception(f"FSM router call failed: {e}")
         return "I’m having trouble reaching my brain service right now. Please try again."
 
+
 # -------------------------
 # Topic inference (generic, light)
 # -------------------------
@@ -263,6 +364,7 @@ _TOPIC_PREFIXES = [
     "help me understand ",
 ]
 
+
 def _infer_topic(text: str) -> Optional[str]:
     if not text:
         return None
@@ -272,28 +374,28 @@ def _infer_topic(text: str) -> Optional[str]:
             return text[len(p):].strip(" .?!")
     return None
 
+
 def _normalize_short(text: str) -> str:
     t = (text or "").strip().lower()
     t = re.sub(r"[^\w\s']", "", t).strip()
     return t
 
+
 def _is_short_followup(text: str) -> bool:
-    # One to three words like: "breeds", "history", "price", "steps", "habitat", "three"
     t = _normalize_short(text)
     if not t:
         return False
     return len(t.split()) <= 3
 
+
 # -------------------------
 # OpenAI helpers
 # -------------------------
 def _extract_openai_text(data: dict) -> str:
-    # Best-case: Responses API provides output_text directly
     ot = data.get("output_text")
     if isinstance(ot, str) and ot.strip():
         return ot.strip()
 
-    # Next: scan output items for message content
     out = data.get("output")
     if isinstance(out, list):
         parts = []
@@ -311,7 +413,6 @@ def _extract_openai_text(data: dict) -> str:
         if joined:
             return joined
 
-    # Last: some server tiers put text in "text"
     t = data.get("text")
     if isinstance(t, str) and t.strip():
         return t.strip()
@@ -322,6 +423,7 @@ def _extract_openai_text(data: dict) -> str:
                 return v.strip()
 
     return ""
+
 
 def _output_sample_types(data: dict) -> list:
     out = data.get("output")
@@ -336,6 +438,7 @@ def _output_sample_types(data: dict) -> list:
                     }
                 )
     return types
+
 
 async def _openai_post(payload: dict) -> Tuple[int, dict, str]:
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
@@ -353,9 +456,9 @@ async def _openai_post(payload: dict) -> Tuple[int, dict, str]:
     except Exception:
         data = {}
     if status >= 400:
-        # Raise after we capture details
         r.raise_for_status()
     return status, data, txt
+
 
 async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -> str:
     if not OPENAI_API_KEY:
@@ -366,7 +469,6 @@ async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -
     last_user = st.get("last_user") or ""
     last_bot = st.get("last_bot") or ""
 
-    # If user says a short follow-up, nudge the model to treat it as a follow-up
     followup = _is_short_followup(user_text)
 
     system = (
@@ -397,12 +499,10 @@ async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -
         "max_output_tokens": 220,
     }
 
-    # Optional reasoning. If it causes "reasoning-only" outputs, set OPENAI_REASONING_EFFORT="" in Render.
     if OPENAI_REASONING_EFFORT in ("low", "medium", "high"):
         payload["reasoning"] = {"effort": OPENAI_REASONING_EFFORT}
 
     try:
-        # First attempt
         _, data, _raw = await _openai_post(payload)
         text_out = _extract_openai_text(data)
         if text_out:
@@ -410,7 +510,6 @@ async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -
 
         logger.warning(f"OpenAI parse failed. output_sample_types={_output_sample_types(data)}")
 
-        # Retry once: disable reasoning + force plain text
         payload2 = dict(payload)
         payload2.pop("reasoning", None)
         payload2["input"] = [
@@ -433,6 +532,7 @@ async def openai_reply(user_text: str, state: Optional[Dict[str, Any]] = None) -
         logger.exception(f"OpenAI reply failed: {e}")
         return "I had trouble reaching my brain service. Please try again."
 
+
 # -------------------------
 # Router endpoint (topic-agnostic)
 # -------------------------
@@ -447,12 +547,10 @@ async def assistant_route(request: Request):
     if not text:
         return {"spoken_reply": "I didn’t catch that. Can you say it again?", "intent": "general", "actions": [], "state": state}
 
-    # Infer/update topic from explicit "tell me about X" style asks
     inferred = _infer_topic(text)
     if inferred:
         state["topic"] = inferred
 
-    # Also allow topic updates if user says "switch topic to X" or "new topic: X"
     low = text.lower().strip()
     m = re.search(r"(?:new topic|switch topic|topic is|topic:)\s*(.+)$", low)
     if m:
@@ -466,6 +564,7 @@ async def assistant_route(request: Request):
     state["last_bot"] = reply
 
     return {"spoken_reply": reply, "intent": "general", "actions": [], "state": state}
+
 
 # -------------------------
 # Twilio stream WebSocket
@@ -488,6 +587,10 @@ async def twilio_stream(websocket: WebSocket):
     last_final_text = ""
 
     assistant_speaking = False
+
+    # Audio probes (created once we have streamSid)
+    in_probe: Optional[StreamProbe] = None
+    out_probe: Optional[StreamProbe] = None
 
     async def cancel_speaking():
         nonlocal speak_task, assistant_speaking
@@ -523,164 +626,12 @@ async def twilio_stream(websocket: WebSocket):
                 nonlocal assistant_speaking
                 try:
                     ulaw = await elevenlabs_tts_ulaw_bytes(spoken)
-                    await stream_ulaw_audio_to_twilio(websocket, stream_sid, ulaw, speak_cancel)
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    logger.exception(f"ElevenLabs/Twilio speak failed: {e}")
-                finally:
-                    assistant_speaking = False
 
-            speak_task = asyncio.create_task(_run())
+                    # One-time sanity log: does the first outbound chunk look like ulaw frames?
+                    if AUDIO_DEBUG and ulaw:
+                        logger.info(
+                            "[AUDIO_PROBE] out_blob streamSid=%s bytes=%d first_chunk_type=%s",
+                            stream_sid, len(ulaw), sniff_audio_header(ulaw[:16]),
+                        )
 
-    async def deepgram_reader():
-        nonlocal last_final_ts, last_final_text, assistant_speaking
-
-        try:
-            async for msg in dg_ws:
-                try:
-                    data = json.loads(msg)
-                except Exception:
-                    continue
-
-                ch = data.get("channel") or {}
-                alts = ch.get("alternatives") or []
-                if not alts:
-                    continue
-
-                transcript = (alts[0].get("transcript") or "").strip()
-                if not transcript:
-                    continue
-
-                is_final = bool(data.get("is_final"))
-
-                # barge-in: if user speaks while assistant talking (interim is enough)
-                if assistant_speaking and not is_final:
-                    await cancel_speaking()
-
-                if not is_final:
-                    continue
-
-                now = time.time()
-                if len(transcript) < MIN_FINAL_CHARS:
-                    continue
-
-                if transcript == last_final_text and (now - last_final_ts) < 1.0:
-                    continue
-
-                if (now - last_final_ts) * 1000 < FINAL_UTTERANCE_COOLDOWN_MS:
-                    if transcript.lower() in last_final_text.lower():
-                        continue
-
-                last_final_text = transcript
-                last_final_ts = now
-
-                logger.info(f"Deepgram FINAL: {transcript}")
-
-                if not stream_sid:
-                    continue
-
-                # Optional: small acknowledgement BEFORE long thinking
-                if ACK_BEFORE_THINKING:
-                    try:
-                        await speak("Okay.")
-                    except Exception:
-                        pass
-
-                state = CALL_STATE.get(stream_sid) or {"topic": None, "last_user": "", "last_bot": ""}
-                state["last_user"] = transcript
-                CALL_STATE[stream_sid] = state
-
-                reply = await call_fsm_router(transcript, meta={"stream_sid": stream_sid, "state": state})
-                logger.info(f"Router reply: {reply}")
-
-                state["last_bot"] = reply
-                CALL_STATE[stream_sid] = state
-
-                await speak(reply)
-
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            logger.exception(f"Deepgram reader error: {e}")
-
-    try:
-        if not DEEPGRAM_API_KEY:
-            logger.error("Missing DEEPGRAM_API_KEY; cannot transcribe")
-        else:
-            logger.info("Connecting to Deepgram realtime WebSocket...")
-            dg_ws = await websockets.connect(
-                deepgram_ws_url(),
-                extra_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"},
-                ping_interval=10,
-                ping_timeout=20,
-                close_timeout=5,
-                max_size=2**23,
-            )
-            logger.info("Connected to Deepgram realtime.")
-            dg_task = asyncio.create_task(deepgram_reader())
-
-        while True:
-            raw = await websocket.receive_text()
-            evt = json.loads(raw)
-            etype = evt.get("event")
-
-            if etype == "connected":
-                logger.info("Twilio stream event: connected")
-                continue
-
-            if etype == "start":
-                stream_sid = evt.get("start", {}).get("streamSid")
-                logger.info(f"Twilio stream event: start (streamSid={stream_sid})")
-                if stream_sid:
-                    CALL_STATE[stream_sid] = {"topic": None, "last_user": "", "last_bot": ""}
-
-                try:
-                    await speak("I’m connected. How can I help you today?")
-                except Exception:
-                    logger.exception("Initial ElevenLabs greeting failed")
-                continue
-
-            if etype == "media":
-                if dg_ws is not None:
-                    payload_b64 = evt.get("media", {}).get("payload")
-                    if payload_b64:
-                        try:
-                            audio_bytes = _b64_to_bytes(payload_b64)
-                            await dg_ws.send(audio_bytes)
-                        except Exception:
-                            logger.exception("Failed sending audio to Deepgram")
-                continue
-
-            if etype == "stop":
-                logger.info("Twilio stream event: stop")
-                break
-
-    except Exception as e:
-        logger.exception(f"Twilio stream handler error: {e}")
-
-    finally:
-        try:
-            await cancel_speaking()
-        except Exception:
-            pass
-
-        if dg_task:
-            dg_task.cancel()
-            try:
-                await dg_task
-            except Exception:
-                pass
-
-        if dg_ws:
-            try:
-                await dg_ws.close()
-            except Exception:
-                pass
-
-        try:
-            await websocket.close()
-        except Exception:
-            pass
-
-        logger.info("Twilio media stream handler completed")
+                    await stre
