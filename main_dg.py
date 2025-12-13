@@ -16,6 +16,9 @@ from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import PlainTextResponse
 
 from vozlia_obs import ObsHub, mount_routes  # <- your obs hub/routes
+from assistant_route import router as assistant_router
+app.include_router(assistant_router)
+
 
 
 # -------------------------
