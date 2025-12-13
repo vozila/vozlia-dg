@@ -11,7 +11,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse, PlainTextResponse
 
 
-OBS_ENABLED = os.getenv("OBS_ENABLED", "1") == "1"
+OBS_ENABLED = os.getenv("OBS_ENABLED", "0") == "1"
 OBS_LOG_JSON = os.getenv("OBS_LOG_JSON", "0") == "1"
 OBS_MAX_EVENTS_PER_CALL = int(os.getenv("OBS_MAX_EVENTS_PER_CALL", "5000"))
 OBS_BACKFILL = int(os.getenv("OBS_BACKFILL", "300"))
